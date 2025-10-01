@@ -9,8 +9,9 @@ const FormData = require('form-data');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// Configure Multer for in-memory storage (Vercel best practice)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } }); // Limit to 50MB for single file upload test
+// Configure Multer for in-memory storage (Increased limit for bigger files)
+const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB limit for Vercel function memory
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_FILE_SIZE } }); 
 
 const app = express();
 
@@ -18,7 +19,6 @@ const app = express();
 app.use(bodyParser.json());
 
 // --- CORS FIX ---
-// This forces the necessary headers to allow the ZapTalk front-end to connect.
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*'); 
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -29,8 +29,20 @@ app.use((req, res, next) => {
     next();
 });
 
+// Helper function to determine Telegram endpoint and file parameter name
+function getTelegramEndpoint(mimetype) {
+    if (mimetype.startsWith('image/')) {
+        return { endpoint: 'sendPhoto', paramName: 'photo', fileType: 'photo' };
+    }
+    if (mimetype.startsWith('video/')) {
+        return { endpoint: 'sendVideo', paramName: 'video', fileType: 'video' };
+    }
+    // Default for documents, PDFs, zips, etc.
+    return { endpoint: 'sendDocument', paramName: 'document', fileType: 'document' };
+}
+
+
 // --- UPLOAD ENDPOINT ---
-// Use multer middleware to handle file upload
 module.exports = app.post('/api/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ success: false, message: 'File nahi mili.' });
@@ -44,34 +56,58 @@ module.exports = app.post('/api/upload', upload.single('file'), async (req, res)
         const file = req.file;
         const form = new FormData();
         
-        // Telegram API requires the file to be sent as 'document' or 'photo'
+        const { endpoint, paramName } = getTelegramEndpoint(file.mimetype);
+
         form.append('chat_id', CHANNEL_ID);
-        form.append('document', file.buffer, {
+        // Use the determined parameter name (photo, video, or document)
+        form.append(paramName, file.buffer, {
             filename: file.originalname,
             contentType: file.mimetype,
         });
+        
+        // Add caption for all files (optional)
+        form.append('caption', `ZapTalk File: ${file.originalname}`);
 
-        // 1. Send file to Telegram
-        const telegramUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`;
+
+        // 1. Send file to Telegram using the specific endpoint
+        const telegramUrl = `https://api.telegram.org/bot${BOT_TOKEN}/${endpoint}`;
         const telegramResponse = await fetch(telegramUrl, {
             method: 'POST',
             body: form,
-            // Telegram expects boundary headers to be set by the FormData object itself
             headers: form.getHeaders(), 
         });
 
         const telegramData = await telegramResponse.json();
 
         if (telegramData.ok) {
-            // 2. Extract the permanent file ID
-            const fileId = telegramData.result.document.file_id;
+            // 2. Extract the permanent file ID (It could be photo[0], video, or document)
+            let resultObject = telegramData.result;
             
+            // Get the specific object (e.g., photo object, video object, or document object)
+            if (resultObject.photo) {
+                // For photos, the highest resolution file is the last element
+                resultObject = resultObject.photo.pop(); 
+            } else if (resultObject.document) {
+                resultObject = resultObject.document;
+            } else if (resultObject.video) {
+                resultObject = resultObject.video;
+            }
+            
+            // Extract file_id and ensure it's correct
+            const fileId = resultObject ? resultObject.file_id : null;
+            
+            if (!fileId) {
+                console.error("File ID extraction failed:", telegramData);
+                return res.status(500).json({ success: false, message: 'Telegram file ID extract nahi hua.' });
+            }
+
             return res.status(200).json({
                 success: true,
                 message: 'File successfully uploaded to Telegram.',
                 telegramFileId: fileId,
                 fileName: file.originalname,
                 fileSize: file.size,
+                fileType: file.mimetype.split('/')[0]
             });
         } else {
             console.error("Telegram Error:", telegramData);
