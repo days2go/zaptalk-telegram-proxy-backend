@@ -81,24 +81,31 @@ module.exports = app.post('/api/upload', upload.single('file'), async (req, res)
 
         if (telegramData.ok) {
             // 2. Extract the permanent file ID (It could be photo[0], video, or document)
-            let resultObject = telegramData.result;
+            let resultObject = telegramData.result.document || telegramData.result.photo?.pop() || telegramData.result.video;
             
-            // Get the specific object (e.g., photo object, video object, or document object)
-            if (resultObject.photo) {
+            // For general messages (which contain the file object)
+            if (telegramData.result.document) {
+                resultObject = telegramData.result.document;
+            } else if (telegramData.result.photo) {
                 // For photos, the highest resolution file is the last element
-                resultObject = resultObject.photo.pop(); 
-            } else if (resultObject.document) {
-                resultObject = resultObject.document;
-            } else if (resultObject.video) {
-                resultObject = resultObject.video;
+                resultObject = telegramData.result.photo.pop(); 
+            } else if (telegramData.result.video) {
+                resultObject = telegramData.result.video;
+            } else if (telegramData.result.message) {
+                 // Sometimes the result is wrapped in 'message' for channel posts
+                 const message = telegramData.result.message;
+                 resultObject = message.document || message.photo?.pop() || message.video;
+            } else if (telegramData.result.channel_post) {
+                 const post = telegramData.result.channel_post;
+                 resultObject = post.document || post.photo?.pop() || post.video;
             }
             
             // Extract file_id and ensure it's correct
             const fileId = resultObject ? resultObject.file_id : null;
             
             if (!fileId) {
-                console.error("File ID extraction failed:", telegramData);
-                return res.status(500).json({ success: false, message: 'Telegram file ID extract nahi hua.' });
+                console.error("File ID extraction failed. Telegram Data:", telegramData);
+                return res.status(500).json({ success: false, message: 'Telegram file ID extract nahi hua. (Check logs).' });
             }
 
             return res.status(200).json({
