@@ -1,77 +1,118 @@
-// Required packages
+// Telegram Proxy Logic: This runs on the Vercel Serverless Function (api/upload.js)
 const express = require('express');
+const bodyParser = require('body-parser');
 const multer = require('multer');
-const FormData = require('form-data');
 const fetch = require('node-fetch');
-const cors = require('cors');
+const FormData = require('form-data');
 
-// Initialize Express app
+// Get sensitive keys from Vercel Environment Variables
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+
+// Configure Multer for in-memory storage (Vercel best practice)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } }); // Limit to 50MB for single file upload test
+
 const app = express();
 
-// Use CORS to allow requests from your frontend
-app.use(cors());
+// Use body-parser for other requests
+app.use(bodyParser.json());
 
-// Use Multer for handling file uploads in memory
-const upload = multer({ storage: multer.memoryStorage() });
-
-// Environment Variables (Yeh aap Vercel mein set karenge)
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-
-if (!BOT_TOKEN || !CHAT_ID) {
-    console.error("Zaroori environment variables (BOT_TOKEN, CHAT_ID) set nahi hain.");
-}
-
-// The main upload route
-app.post('/api/upload', upload.single('file'), async (req, res) => {
-    if (!BOT_TOKEN || !CHAT_ID) {
-        return res.status(500).json({ success: false, error: "Server configuration galat hai." });
+// --- CORS FIX ---
+// This forces the necessary headers to allow the ZapTalk front-end to connect.
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
     }
-  
+    next();
+});
+
+// --- UPLOAD ENDPOINT ---
+// Use multer middleware to handle file upload
+module.exports = app.post('/api/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
-        return res.status(400).json({ success: false, error: 'Koi file upload nahi hui.' });
+        return res.status(400).json({ success: false, message: 'File nahi mili.' });
+    }
+
+    if (!BOT_TOKEN || !CHANNEL_ID) {
+        return res.status(500).json({ success: false, message: 'Server keys (BOT/CHANNEL ID) set nahi hain.' });
     }
 
     try {
-        const fileBuffer = req.file.buffer;
-        const originalName = req.file.originalname;
-        const fileSize = req.file.size;
-
-        // Create a form and append the file
-        const formData = new FormData();
-        formData.append('document', fileBuffer, originalName);
-        formData.append('chat_id', CHAT_ID);
-        formData.append('caption', `File Upload: ${originalName}`);
+        const file = req.file;
+        const form = new FormData();
         
-        // Telegram Bot API URL
-        const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`;
-
-        // Send the file to Telegram
-        const response = await fetch(url, {
-            method: 'POST',
-            body: formData,
+        // Telegram API requires the file to be sent as 'document' or 'photo'
+        form.append('chat_id', CHANNEL_ID);
+        form.append('document', file.buffer, {
+            filename: file.originalname,
+            contentType: file.mimetype,
         });
 
-        const telegramResult = await response.json();
+        // 1. Send file to Telegram
+        const telegramUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`;
+        const telegramResponse = await fetch(telegramUrl, {
+            method: 'POST',
+            body: form,
+            // Telegram expects boundary headers to be set by the FormData object itself
+            headers: form.getHeaders(), 
+        });
 
-        // Check if Telegram returned success
-        if (telegramResult.ok) {
-            const fileId = telegramResult.result.document.file_id;
-            res.status(200).json({
+        const telegramData = await telegramResponse.json();
+
+        if (telegramData.ok) {
+            // 2. Extract the permanent file ID
+            const fileId = telegramData.result.document.file_id;
+            
+            return res.status(200).json({
                 success: true,
+                message: 'File successfully uploaded to Telegram.',
                 telegramFileId: fileId,
-                fileName: originalName,
-                fileSize: fileSize,
+                fileName: file.originalname,
+                fileSize: file.size,
             });
         } else {
-            // If Telegram returned an error
-            res.status(500).json({ success: false, error: telegramResult.description });
+            console.error("Telegram Error:", telegramData);
+            return res.status(500).json({ success: false, message: `Telegram upload failed: ${telegramData.description || 'Unknown error'}` });
         }
+
     } catch (error) {
-        console.error('Upload mein error:', error);
-        res.status(500).json({ success: false, error: 'Internal server error.' });
+        console.error("Internal Upload Error:", error);
+        return res.status(500).json({ success: false, message: 'Internal server error during file processing.' });
     }
 });
 
-// Export the app for Vercel
-module.exports = app;
+
+// --- DOWNLOAD ENDPOINT (Client will request this URL to get the file link) ---
+app.get('/api/download/:fileId', async (req, res) => {
+    const fileId = req.params.fileId;
+    
+    if (!BOT_TOKEN || !fileId) {
+        return res.status(400).json({ success: false, message: 'Invalid request parameters.' });
+    }
+
+    try {
+        // 1. Get file path from Telegram
+        const getFilePathUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
+        const filePathResponse = await fetch(getFilePathUrl);
+        const filePathData = await filePathResponse.json();
+
+        if (!filePathData.ok) {
+            return res.status(404).json({ success: false, message: 'File not found on Telegram.' });
+        }
+        
+        const filePath = filePathData.result.file_path;
+        
+        // 2. Construct the direct download URL
+        const fileDownloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+        // 3. Redirect the client to the download URL
+        res.redirect(fileDownloadUrl);
+
+    } catch (error) {
+        console.error("Download Error:", error);
+        return res.status(500).json({ success: false, message: 'Error processing download request.' });
+    }
+});
