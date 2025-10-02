@@ -1,161 +1,142 @@
-// Telegram Proxy Logic: This runs on the Vercel Serverless Function (api/upload.js)
 const express = require('express');
-const bodyParser = require('body-parser');
-const multer = require('multer');
 const fetch = require('node-fetch');
+const multer = require('multer');
 const FormData = require('form-data');
+const cors = require('cors');
 
-// Get sensitive keys from Vercel Environment Variables
+// Get keys from Vercel Environment Variables
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// Configure Multer for in-memory storage (Increased limit for bigger files)
-const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB limit for Vercel function memory
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_FILE_SIZE } }); 
+// Set Multer memory storage and file limit (100 MB)
+const storage = multer.memoryStorage();
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 100 * 1024 * 1024 } 
+}); 
 
 const app = express();
 
-// Use body-parser for other requests
-app.use(bodyParser.json());
+// CRITICAL FIX: Enable CORS for all origins (Network fix)
+app.use(cors());
 
-// --- CORS FIX ---
-app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-    next();
-});
-
-// Helper function to determine Telegram endpoint and file parameter name
-function getTelegramEndpoint(mimetype) {
-    if (mimetype.startsWith('image/')) {
-        return { endpoint: 'sendPhoto', paramName: 'photo', fileType: 'photo' };
-    }
-    if (mimetype.startsWith('video/')) {
-        return { endpoint: 'sendVideo', paramName: 'video', fileType: 'video' };
-    }
-    // Default for documents, PDFs, zips, etc.
-    return { endpoint: 'sendDocument', paramName: 'document', fileType: 'document' };
-}
-
-
-// --- UPLOAD ENDPOINT ---
-module.exports = app.post('/api/upload', upload.single('file'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ success: false, message: 'File nahi mili.' });
-    }
-
+// Define the root endpoint (for Vercel's serverless function structure)
+const handler = async (req, res) => {
+    // Check for necessary keys
     if (!BOT_TOKEN || !CHANNEL_ID) {
-        return res.status(500).json({ success: false, message: 'Server keys (BOT/CHANNEL ID) set nahi hain.' });
+        return res.status(500).json({ success: false, message: "Server configuration missing (BOT_TOKEN or CHANNEL_ID)." });
     }
 
-    try {
-        const file = req.file;
-        const form = new FormData();
-        
-        const { endpoint, paramName } = getTelegramEndpoint(file.mimetype);
-
-        form.append('chat_id', CHANNEL_ID);
-        // Use the determined parameter name (photo, video, or document)
-        form.append(paramName, file.buffer, {
-            filename: file.originalname,
-            contentType: file.mimetype,
-        });
-        
-        // Add caption for all files (optional)
-        form.append('caption', `ZapTalk File: ${file.originalname}`);
-
-
-        // 1. Send file to Telegram using the specific endpoint
-        const telegramUrl = `https://api.telegram.org/bot${BOT_TOKEN}/${endpoint}`;
-        const telegramResponse = await fetch(telegramUrl, {
-            method: 'POST',
-            body: form,
-            headers: form.getHeaders(), 
-        });
-
-        const telegramData = await telegramResponse.json();
-
-        if (telegramData.ok) {
-            // 2. Extract the permanent file ID (It could be photo[0], video, or document)
-            let resultObject = telegramData.result.document || telegramData.result.photo?.pop() || telegramData.result.video;
-            
-            // For general messages (which contain the file object)
-            if (telegramData.result.document) {
-                resultObject = telegramData.result.document;
-            } else if (telegramData.result.photo) {
-                // For photos, the highest resolution file is the last element
-                resultObject = telegramData.result.photo.pop(); 
-            } else if (telegramData.result.video) {
-                resultObject = telegramData.result.video;
-            } else if (telegramData.result.message) {
-                 // Sometimes the result is wrapped in 'message' for channel posts
-                 const message = telegramData.result.message;
-                 resultObject = message.document || message.photo?.pop() || message.video;
-            } else if (telegramData.result.channel_post) {
-                 const post = telegramData.result.channel_post;
-                 resultObject = post.document || post.photo?.pop() || post.video;
-            }
-            
-            // Extract file_id and ensure it's correct
-            const fileId = resultObject ? resultObject.file_id : null;
-            
-            if (!fileId) {
-                console.error("File ID extraction failed. Telegram Data:", telegramData);
-                return res.status(500).json({ success: false, message: 'Telegram file ID extract nahi hua. (Check logs).' });
+    // Handle file upload requests
+    if (req.url === '/api/upload' && req.method === 'POST') {
+        upload.single('file')(req, res, async (err) => {
+            if (err instanceof multer.MulterError) {
+                return res.status(400).json({ success: false, message: `Multer Error: ${err.message}` });
+            } else if (err) {
+                return res.status(500).json({ success: false, message: `Unknown Upload Error: ${err.message}` });
             }
 
-            return res.status(200).json({
-                success: true,
-                message: 'File successfully uploaded to Telegram.',
-                telegramFileId: fileId,
-                fileName: file.originalname,
-                fileSize: file.size,
-                fileType: file.mimetype.split('/')[0]
-            });
-        } else {
-            console.error("Telegram Error:", telegramData);
-            return res.status(500).json({ success: false, message: `Telegram upload failed: ${telegramData.description || 'Unknown error'}` });
-        }
+            const file = req.file;
 
-    } catch (error) {
-        console.error("Internal Upload Error:", error);
-        return res.status(500).json({ success: false, message: 'Internal server error during file processing.' });
-    }
-});
+            if (!file) {
+                return res.status(400).json({ success: false, message: "File data nahi mila." });
+            }
+
+            const form = new FormData();
+            form.append('chat_id', CHANNEL_ID);
+            form.append('caption', `Cozy Messenger File: ${file.originalname}`);
+
+            // Determine Telegram API endpoint based on file type for powerful handling
+            let telegramMethod;
+            if (file.mimetype.startsWith('image/')) {
+                telegramMethod = 'sendPhoto';
+                form.append('photo', file.buffer, { filename: file.originalname, contentType: file.mimetype });
+            } else if (file.mimetype.startsWith('video/')) {
+                telegramMethod = 'sendVideo';
+                form.append('video', file.buffer, { filename: file.originalname, contentType: file.mimetype });
+            } else {
+                telegramMethod = 'sendDocument';
+                form.append('document', file.buffer, { filename: file.originalname, contentType: file.mimetype });
+            }
+
+            try {
+                const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${telegramMethod}`, {
+                    method: 'POST',
+                    body: form,
+                    headers: form.getHeaders()
+                });
+
+                const telegramResult = await telegramResponse.json();
+
+                if (telegramResult.ok) {
+                    let telegramFileId;
+                    // Extract file ID reliably based on media type for later download
+                    const message = telegramResult.result;
+                    if (message.photo) {
+                         // Photo sends an array; take the largest size file_id
+                         telegramFileId = message.photo.pop().file_id;
+                    } else if (message.video) {
+                        telegramFileId = message.video.file_id;
+                    } else if (message.document) {
+                        telegramFileId = message.document.file_id;
+                    }
+                    // Fallback check for file_id
+                    if (!telegramFileId) {
+                         return res.status(500).json({ success: false, message: "Telegram ne File ID nahi diya, lekin upload successful raha.", raw: telegramResult });
+                    }
 
 
-// --- DOWNLOAD ENDPOINT (Client will request this URL to get the file link) ---
-app.get('/api/download/:fileId', async (req, res) => {
-    const fileId = req.params.fileId;
+                    return res.status(200).json({
+                        success: true,
+                        message: "File successfully uploaded to Telegram.",
+                        telegramFileId: telegramFileId,
+                        fileName: file.originalname,
+                        fileSize: file.size
+                    });
+                } else {
+                    return res.status(500).json({ success: false, message: "Telegram API Error.", details: telegramResult });
+                }
+            } catch (error) {
+                console.error("Telegram Upload Failed:", error);
+                return res.status(500).json({ success: false, message: `Internal Server Error: ${error.message}` });
+            }
+        });
+    } 
     
-    if (!BOT_TOKEN || !fileId) {
-        return res.status(400).json({ success: false, message: 'Invalid request parameters.' });
+    // Handle file download requests (GET /api/download/FILE_ID)
+    else if (req.url.startsWith('/api/download/')) {
+         const fileId = req.url.split('/').pop();
+         if (!fileId || fileId === 'download' || fileId === 'api') {
+              return res.status(400).json({ success: false, message: "Invalid File ID" });
+         }
+
+         try {
+             // 1. Get file path from Telegram
+             const pathResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
+             const pathResult = await pathResponse.json();
+
+             if (!pathResult.ok) {
+                 return res.status(500).json({ success: false, message: "Telegram file path nahi mila.", details: pathResult });
+             }
+
+             const filePath = pathResult.result.file_path;
+             const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+             // 2. Redirect user to the Telegram CDN link for direct download
+             res.setHeader('Location', downloadUrl);
+             return res.status(302).send('Redirecting to download...');
+
+         } catch (error) {
+              console.error("Download Failed:", error);
+              return res.status(500).json({ success: false, message: `Download Error: ${error.message}` });
+         }
+
+    } 
+    
+    // Default Vercel route handling
+    else {
+        res.status(200).send('Cozy Messenger Proxy is Running.');
     }
+};
 
-    try {
-        // 1. Get file path from Telegram
-        const getFilePathUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
-        const filePathResponse = await fetch(getFilePathUrl);
-        const filePathData = await filePathResponse.json();
-
-        if (!filePathData.ok) {
-            return res.status(404).json({ success: false, message: 'File not found on Telegram.' });
-        }
-        
-        const filePath = filePathData.result.file_path;
-        
-        // 2. Construct the direct download URL
-        const fileDownloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-
-        // 3. Redirect the client to the download URL
-        res.redirect(fileDownloadUrl);
-
-    } catch (error) {
-        console.error("Download Error:", error);
-        return res.status(500).json({ success: false, message: 'Error processing download request.' });
-    }
-});
+module.exports = handler;
